@@ -64,7 +64,10 @@ ctx7 = Context7Client(api_key=CONTEXT7_API_KEY)
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    # Defensive: Bot.user or Bot.user.id could be None if not fully ready
+    bot_user = getattr(bot, "user", None)
+    bot_user_id = getattr(getattr(bot, "user", None), "id", None)
+    log.info("Logged in as %s (ID: %s)", bot_user, bot_user_id)
     try:
         synced = await bot.tree.sync()
         log.info("Synced %d slash command(s)", len(synced))
@@ -87,13 +90,19 @@ async def ask_command(
     lib_ids = ALL_LIBRARY_IDS if chosen == "__all__" else [chosen]
     source_label = source.name if source else "Official Docs"
 
-    user = interaction.user
-    guild = interaction.guild
+    user = getattr(interaction, "user", None)
+    guild = getattr(interaction, "guild", None)
+    user_id = getattr(user, "id", None)
+    guild_repr = guild if guild is not None else "DM"
     log.info(
         "/ask invoked by %s (%s) in %s — question: %r, source: %s",
-        user, user.id, guild or "DM", question, source_label,
+        user, user_id, guild_repr, question, source_label,
     )
-    await interaction.response.defer(thinking=True)
+    try:
+        await interaction.response.defer(thinking=True)
+    except Exception:
+        log.warning("Could not defer response to /ask", exc_info=True)
+        # Fail gracefully and continue
 
     t0 = time.perf_counter()
     try:
@@ -103,6 +112,7 @@ async def ask_command(
                 if isinstance(snippets, list):
                     log.info("  %s returned %d snippet(s)", lib_id, len(snippets))
                     for s in snippets:
+                        # Defensive: Don't overwrite user fields, but _source_lib is unique enough
                         s["_source_lib"] = lib_id
                     return snippets
                 log.warning("  %s returned unexpected type: %s", lib_id, type(snippets).__name__)
@@ -110,33 +120,47 @@ async def ask_command(
                 log.warning("  Failed to fetch from %s, skipping", lib_id, exc_info=True)
             return []
 
-        results = await asyncio.gather(*[_fetch(lib) for lib in lib_ids])
-        all_snippets = [s for batch in results for s in batch]
+        results = await asyncio.gather(*[_fetch(lib) for lib in lib_ids], return_exceptions=False)
+        # Defensive: flatten results, skipping None
+        all_snippets = [s for batch in results if isinstance(batch, list) for s in batch]
 
         elapsed = time.perf_counter() - t0
 
         if not all_snippets:
             log.info("No snippets found for %r (%.2fs)", question, elapsed)
-            await interaction.followup.send(
-                "No documentation found for that question. Try rephrasing it."
-            )
+            try:
+                await interaction.followup.send(
+                    "No documentation found for that question. Try rephrasing it."
+                )
+            except Exception:
+                log.warning("Could not send followup for no snippets", exc_info=True)
             return
 
         log.info(
             "Fetched %d snippet(s) for %r (%.2fs)",
             len(all_snippets), question, elapsed,
         )
-        embed = build_embed(question, all_snippets, source_label)
-        await interaction.followup.send(embed=embed)
+        try:
+            embed = build_embed(question, all_snippets, source_label)
+            await interaction.followup.send(embed=embed)
+        except Exception as embed_exc:
+            log.exception("Failed to send embed for %r: %r", question, embed_exc)
+            await interaction.followup.send("Couldn't display results due to a formatting error.")
 
     except Exception as exc:
         log.exception("/ask failed for %r", question)
-        await interaction.followup.send(f"Something went wrong: `{exc}`")
+        try:
+            await interaction.followup.send(f"Something went wrong: `{exc}`")
+        except Exception:
+            # Can't even send the error message
+            pass
 
 
 @bot.tree.command(name="help_oh", description="Show what this bot can do")
 async def help_command(interaction: discord.Interaction):
-    log.info("/help_oh invoked by %s (%s)", interaction.user, interaction.user.id)
+    user = getattr(interaction, "user", None)
+    user_id = getattr(user, "id", None)
+    log.info("/help_oh invoked by %s (%s)", user, user_id)
     embed = discord.Embed(
         title="OpenHands Docs Bot",
         description=(
@@ -158,7 +182,11 @@ async def help_command(interaction: discord.Interaction):
         color=0x5865F2,
     )
     embed.set_footer(text="Powered by Context7")
-    await interaction.response.send_message(embed=embed)
+    try:
+        await interaction.response.send_message(embed=embed)
+    except Exception:
+        log.warning("Could not send /help_oh message", exc_info=True)
+        # Fail gracefully
 
 
 def _dedup_snippets(snippets: list[dict]) -> list[dict]:
@@ -167,6 +195,9 @@ def _dedup_snippets(snippets: list[dict]) -> list[dict]:
     unique: list[dict] = []
     for snip in snippets:
         content = snip.get("content", "")
+        # Defensive: If content is not string, ignore this snippet
+        if not isinstance(content, str):
+            continue
         # Extract the first meaningful chunk as a fingerprint
         fingerprint = content[:200].strip().lower()
         if fingerprint in seen:
@@ -178,17 +209,20 @@ def _dedup_snippets(snippets: list[dict]) -> list[dict]:
 
 def _safe_truncate(text: str, limit: int) -> str:
     """Truncate text without breaking markdown code blocks."""
+    if not isinstance(text, str):
+        text = str(text)
     if len(text) <= limit:
         return text
 
-    truncated = text[: limit - 1]
+    truncated = text[: max(0, limit - 1)]
 
     # Count opening/closing fences to see if we're inside a code block
     fence_count = truncated.count("```")
     if fence_count % 2 != 0:
         # We're inside an unclosed code block — cut before it opened
         last_open = truncated.rfind("```")
-        truncated = truncated[:last_open].rstrip()
+        if last_open != -1:
+            truncated = truncated[:last_open].rstrip()
 
     return truncated + "…"
 
@@ -209,8 +243,14 @@ def build_embed(query: str, snippets: list[dict], source_label: str = "Official 
 
     for snip in deduped[:6]:
         title = snip.get("title", "Untitled")
+        if not isinstance(title, str):
+            title = str(title)
         content = snip.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
         source = snip.get("source", "")
+        if not isinstance(source, str):
+            source = str(source)
 
         if source:
             source_link = f"\n[Source]({source})"
@@ -228,10 +268,15 @@ def build_embed(query: str, snippets: list[dict], source_label: str = "Official 
             break
         total_len += len(field_text)
 
+        # Defensive: Discord field name max 256
         embed.add_field(name=title[:256], value=field_text, inline=False)
 
     embed.set_footer(text=f"Source: {source_label} · Powered by Context7")
     return embed
 
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception as run_exc:
+        log.critical("Bot failed to run: %r", run_exc)

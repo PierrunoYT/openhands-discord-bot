@@ -39,7 +39,11 @@ class Context7Client:
         for attempt in range(MAX_RETRIES):
             t0 = time.perf_counter()
             log.debug("GET %s params=%s (attempt %d)", url, params, attempt + 1)
-            resp = await session.get(url, params=params)
+            try:
+                resp = await session.get(url, params=params)
+            except Exception as exc:
+                log.error("Exception on GET %s: %s", url, exc)
+                raise
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
             if resp.status == 429:
@@ -48,6 +52,7 @@ class Context7Client:
                     "Rate-limited (429) on %s, retry in %ds (%.0fms)",
                     path, wait, elapsed_ms,
                 )
+                await resp.release()  # Ensure connection is released before next retry
                 await asyncio.sleep(wait)
                 continue
 
@@ -57,7 +62,10 @@ class Context7Client:
                     "HTTP %d on %s (%.0fms): %s",
                     resp.status, path, elapsed_ms, body[:300],
                 )
+                await resp.release()  # Release connection before raising
                 resp.raise_for_status()
+                # If raise_for_status() does not raise, continue (shouldn't happen)
+                continue
 
             log.info("GET %s — %d (%.0fms)", path, resp.status, elapsed_ms)
             return resp
@@ -69,7 +77,10 @@ class Context7Client:
             "/libs/search",
             params={"libraryName": library_name, "query": query},
         )
-        data = await resp.json()
+        try:
+            data = await resp.json()
+        finally:
+            await resp.release()
         if isinstance(data, list):
             return data
         return data.get("results", data.get("libraries", []))
@@ -85,9 +96,14 @@ class Context7Client:
             params={"libraryId": library_id, "query": query, "type": response_type},
         )
         if response_type == "txt":
-            return await resp.text()
+            text = await resp.text()
+            await resp.release()
+            return text
 
-        data = await resp.json()
+        try:
+            data = await resp.json()
+        finally:
+            await resp.release()
         return _normalize_snippets(data)
 
     async def close(self):
@@ -100,7 +116,7 @@ def _normalize_snippets(data) -> list[dict]:
     ``{title, content, source}`` dicts the bot can render."""
 
     if isinstance(data, list):
-        if data and "codeTitle" in data[0]:
+        if data and isinstance(data[0], dict) and "codeTitle" in data[0]:
             return [_convert_code_snippet(s) for s in data]
         return data
 
@@ -133,6 +149,9 @@ def _convert_code_snippet(s: dict) -> dict:
 
     code_list = s.get("codeList") or []
     for block in code_list:
+        # Ensure block is a dict to avoid unexpected errors
+        if not isinstance(block, dict):
+            continue
         lang = block.get("language", "")
         code = block.get("code", "")
         if code:
