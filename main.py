@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -41,10 +42,19 @@ if not DISCORD_TOKEN:
 
 CONTEXT7_API_KEY = os.getenv("CONTEXT7_API_KEY", "")
 
-OPENHANDS_LIBRARIES = [
-    "/all-hands-ai/openhands",
-    "/websites/openhands_dev_sdk",
+DEFAULT_LIBRARY = "/websites/all-hands_dev"
+
+LIBRARY_CHOICES = [
+    app_commands.Choice(name="Official Docs (default)", value="/websites/all-hands_dev"),
+    app_commands.Choice(name="SDK Docs", value="/websites/openhands_dev_sdk"),
+    app_commands.Choice(name="GitHub Repo", value="/all-hands-ai/openhands"),
+    app_commands.Choice(name="All sources", value="__all__"),
+]
+
+ALL_LIBRARY_IDS = [
     "/websites/all-hands_dev",
+    "/websites/openhands_dev_sdk",
+    "/all-hands-ai/openhands",
 ]
 
 intents = discord.Intents.default()
@@ -65,31 +75,45 @@ async def on_ready():
 
 
 @bot.tree.command(name="ask", description="Ask a question about OpenHands")
-@app_commands.describe(question="Your question about OpenHands")
-async def ask_command(interaction: discord.Interaction, question: str):
+@app_commands.describe(
+    question="Your question about OpenHands",
+    source="Which doc source to search (default: Official Docs)",
+)
+@app_commands.choices(source=LIBRARY_CHOICES)
+async def ask_command(
+    interaction: discord.Interaction,
+    question: str,
+    source: app_commands.Choice[str] | None = None,
+):
+    chosen = source.value if source else DEFAULT_LIBRARY
+    lib_ids = ALL_LIBRARY_IDS if chosen == "__all__" else [chosen]
+    source_label = source.name if source else "Official Docs"
+
     user = interaction.user
     guild = interaction.guild
     log.info(
-        "/ask invoked by %s (%s) in %s — question: %r",
-        user, user.id, guild or "DM", question,
+        "/ask invoked by %s (%s) in %s — question: %r, source: %s",
+        user, user.id, guild or "DM", question, source_label,
     )
     await interaction.response.defer(thinking=True)
 
     t0 = time.perf_counter()
     try:
-        all_snippets = []
-        for lib_id in OPENHANDS_LIBRARIES:
+        async def _fetch(lib_id: str) -> list[dict]:
             try:
                 snippets = await ctx7.get_context(lib_id, question, response_type="json")
                 if isinstance(snippets, list):
                     log.info("  %s returned %d snippet(s)", lib_id, len(snippets))
                     for s in snippets:
                         s["_source_lib"] = lib_id
-                    all_snippets.extend(snippets)
-                else:
-                    log.warning("  %s returned unexpected type: %s", lib_id, type(snippets).__name__)
+                    return snippets
+                log.warning("  %s returned unexpected type: %s", lib_id, type(snippets).__name__)
             except Exception:
                 log.warning("  Failed to fetch from %s, skipping", lib_id, exc_info=True)
+            return []
+
+        results = await asyncio.gather(*[_fetch(lib) for lib in lib_ids])
+        all_snippets = [s for batch in results for s in batch]
 
         elapsed = time.perf_counter() - t0
 
@@ -101,10 +125,10 @@ async def ask_command(interaction: discord.Interaction, question: str):
             return
 
         log.info(
-            "Returning %d snippet(s) for %r (%.2fs)",
+            "Fetched %d snippet(s) for %r (%.2fs)",
             len(all_snippets), question, elapsed,
         )
-        embed = build_embed(question, all_snippets)
+        embed = build_embed(question, all_snippets, source_label)
         await interaction.followup.send(embed=embed)
 
     except Exception as exc:
@@ -120,8 +144,13 @@ async def help_command(interaction: discord.Interaction):
         description=(
             "I answer questions about **OpenHands** using up-to-date documentation.\n\n"
             "**Commands:**\n"
-            "`/ask <question>` — Ask anything about OpenHands\n"
+            "`/ask <question> [source]` — Ask anything about OpenHands\n"
             "`/help_oh` — Show this message\n\n"
+            "**Sources (optional dropdown):**\n"
+            "• **Official Docs** — default, user-facing documentation\n"
+            "• **SDK Docs** — building agents with the SDK\n"
+            "• **GitHub Repo** — source code & dev docs\n"
+            "• **All sources** — search everything\n\n"
             "**Example questions:**\n"
             "• How do I install OpenHands?\n"
             "• How to configure a custom agent?\n"
@@ -149,7 +178,24 @@ def _dedup_snippets(snippets: list[dict]) -> list[dict]:
     return unique
 
 
-def build_embed(query: str, snippets: list[dict]) -> discord.Embed:
+def _safe_truncate(text: str, limit: int) -> str:
+    """Truncate text without breaking markdown code blocks."""
+    if len(text) <= limit:
+        return text
+
+    truncated = text[: limit - 1]
+
+    # Count opening/closing fences to see if we're inside a code block
+    fence_count = truncated.count("```")
+    if fence_count % 2 != 0:
+        # We're inside an unclosed code block — cut before it opened
+        last_open = truncated.rfind("```")
+        truncated = truncated[:last_open].rstrip()
+
+    return truncated + "…"
+
+
+def build_embed(query: str, snippets: list[dict], source_label: str = "Official Docs") -> discord.Embed:
     embed = discord.Embed(
         title="OpenHands",
         description=f"**Q:** {query}",
@@ -174,8 +220,7 @@ def build_embed(query: str, snippets: list[dict]) -> discord.Embed:
             source_link = ""
 
         available = max_field_len - len(source_link) - 1
-        if len(content) > available:
-            content = content[:available - 1] + "…"
+        content = _safe_truncate(content, available)
 
         field_text = content + source_link
 
@@ -187,7 +232,7 @@ def build_embed(query: str, snippets: list[dict]) -> discord.Embed:
 
         embed.add_field(name=title[:256], value=field_text, inline=False)
 
-    embed.set_footer(text="Powered by Context7 · Only OpenHands docs")
+    embed.set_footer(text=f"Source: {source_label} · Powered by Context7")
     return embed
 
 
