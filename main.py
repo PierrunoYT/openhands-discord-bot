@@ -134,6 +134,21 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+def _dedup_snippets(snippets: list[dict]) -> list[dict]:
+    """Remove near-duplicate snippets by comparing the first 200 chars of content."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for snip in snippets:
+        content = snip.get("content", "")
+        # Extract the first meaningful chunk as a fingerprint
+        fingerprint = content[:200].strip().lower()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(snip)
+    return unique
+
+
 def build_embed(query: str, snippets: list[dict]) -> discord.Embed:
     embed = discord.Embed(
         title="OpenHands",
@@ -141,34 +156,36 @@ def build_embed(query: str, snippets: list[dict]) -> discord.Embed:
         color=0x57F287,
     )
 
+    deduped = _dedup_snippets(snippets)
+    log.info("Deduped %d → %d unique snippet(s)", len(snippets), len(deduped))
+
     total_len = 0
     max_embed_len = 5500
-    seen_titles = set()
+    max_field_len = 1024  # Discord hard limit per field
 
-    for snip in snippets[:8]:
+    for snip in deduped[:6]:
         title = snip.get("title", "Untitled")
-        if title in seen_titles:
-            continue
-        seen_titles.add(title)
-
         content = snip.get("content", "")
         source = snip.get("source", "")
 
-        if len(content) > 900:
-            content = content[:900] + "…"
-
-        field_text = content
         if source:
-            field_text += f"\n[Source]({source})"
+            source_link = f"\n[Source]({source})"
+        else:
+            source_link = ""
+
+        available = max_field_len - len(source_link) - 1
+        if len(content) > available:
+            content = content[:available - 1] + "…"
+
+        field_text = content + source_link
 
         if not field_text.strip():
             continue
-
         if total_len + len(field_text) > max_embed_len:
             break
         total_len += len(field_text)
 
-        embed.add_field(name=title, value=field_text, inline=False)
+        embed.add_field(name=title[:256], value=field_text, inline=False)
 
     embed.set_footer(text="Powered by Context7 · Only OpenHands docs")
     return embed

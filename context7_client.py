@@ -88,21 +88,58 @@ class Context7Client:
             return await resp.text()
 
         data = await resp.json()
-        if isinstance(data, list):
-            return data
-
-        log.debug("get_context returned dict with keys: %s", list(data.keys()))
-        for key in ("results", "snippets", "context", "data", "items"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-
-        # Last resort: if the dict itself looks like a single snippet, wrap it
-        if "content" in data or "title" in data:
-            return [data]
-
-        log.warning("Could not extract snippets from response: %s", str(data)[:500])
-        return []
+        return _normalize_snippets(data)
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+def _normalize_snippets(data) -> list[dict]:
+    """Convert any Context7 response shape into a flat list of
+    ``{title, content, source}`` dicts the bot can render."""
+
+    if isinstance(data, list):
+        if data and "codeTitle" in data[0]:
+            return [_convert_code_snippet(s) for s in data]
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    if "codeSnippets" in data and isinstance(data["codeSnippets"], list):
+        return [_convert_code_snippet(s) for s in data["codeSnippets"]]
+
+    for key in ("results", "snippets", "context", "data", "items"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+
+    if "content" in data or "title" in data:
+        return [data]
+
+    log.warning("Unknown response shape, keys: %s", list(data.keys()))
+    return []
+
+
+def _convert_code_snippet(s: dict) -> dict:
+    """Map Context7's ``codeSnippets`` schema to the flat format the embed builder uses."""
+    title = s.get("codeTitle") or s.get("pageTitle") or "Untitled"
+    source = s.get("codeId", "")
+
+    parts = []
+    desc = s.get("codeDescription", "")
+    if desc:
+        parts.append(desc)
+
+    code_list = s.get("codeList") or []
+    for block in code_list:
+        lang = block.get("language", "")
+        code = block.get("code", "")
+        if code:
+            parts.append(f"```{lang}\n{code}\n```")
+
+    return {
+        "title": title,
+        "content": "\n\n".join(parts) if parts else "(no content)",
+        "source": source,
+    }
